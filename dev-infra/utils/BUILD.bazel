@@ -16,6 +16,8 @@ ts_library(
         "@npm//@types/node",
         "@npm//@types/shelljs",
         "@npm//chalk",
+        "@npm//inquirer",
+        "@npm//inquirer-autocomplete-prompt",
         "@npm//shelljs",
         "@npm//tslib",
         "@npm//typed-graphqlify",

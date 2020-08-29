@@ -11,15 +11,15 @@ import {spawnSync, SpawnSyncOptions, SpawnSyncReturns} from 'child_process';
 
 import {getConfig, getRepoBaseDir, NgDevConfig} from '../config';
 import {info, yellow} from '../console';
-import {_GithubClient} from './_github';
-
-// Re-export GithubApiRequestError
-export {GithubApiRequestError} from './_github';
+import {GithubClient} from './github';
 
 /** Github response type extended to include the `x-oauth-scopes` headers presence. */
 type RateLimitResponseWithOAuthScopeHeader = Octokit.Response<Octokit.RateLimitGetResponse>&{
   headers: {'x-oauth-scopes': string};
 };
+
+/** Describes a function that can be used to test for given Github OAuth scopes. */
+export type OAuthScopeTestFunction = (scopes: string[], missing: string[]) => void;
 
 /** Error for failed Git commands. */
 export class GitCommandError extends Error {
@@ -51,10 +51,8 @@ export class GitClient {
       `https://${this._githubToken}@github.com/${this.remoteConfig.owner}/${
           this.remoteConfig.name}.git`;
   /** Instance of the authenticated Github octokit API. */
-  github = new _GithubClient(this._githubToken);
+  github = new GithubClient(this._githubToken);
 
-  /** The file path of project's root directory. */
-  private _projectRoot = getRepoBaseDir();
   /** The OAuth scopes available for the provided Github token. */
   private _oauthScopes: Promise<string[]>|null = null;
   /**
@@ -64,7 +62,8 @@ export class GitClient {
   private _githubTokenRegex: RegExp|null = null;
 
   constructor(
-      private _githubToken?: string, private _config: Pick<NgDevConfig, 'github'> = getConfig()) {
+      private _githubToken?: string, private _config: Pick<NgDevConfig, 'github'> = getConfig(),
+      private _projectRoot = getRepoBaseDir()) {
     // If a token has been specified (and is not empty), pass it to the Octokit API and
     // also create a regular expression that can be used for sanitizing Git command output
     // so that it does not print the token accidentally.
@@ -119,9 +118,16 @@ export class GitClient {
     return this.run(['branch', branchName, '--contains', sha]).stdout !== '';
   }
 
-  /** Gets the currently checked out branch. */
-  getCurrentBranch(): string {
-    return this.run(['rev-parse', '--abbrev-ref', 'HEAD']).stdout.trim();
+  /** Gets the currently checked out branch or revision. */
+  getCurrentBranchOrRevision(): string {
+    const branchName = this.run(['rev-parse', '--abbrev-ref', 'HEAD']).stdout.trim();
+    // If no branch name could be resolved. i.e. `HEAD` has been returned, then Git
+    // is currently in a detached state. In those cases, we just want to return the
+    // currently checked out revision/SHA.
+    if (branchName === 'HEAD') {
+      return this.run(['rev-parse', 'HEAD']).stdout.trim();
+    }
+    return branchName;
   }
 
   /** Gets whether the current Git repository has uncommitted changes. */
@@ -145,17 +151,33 @@ export class GitClient {
   }
 
   /**
+   * Checks out a requested branch or revision, optionally cleaning the state of the repository
+   * before attempting the checking. Returns a boolean indicating whether the branch or revision
+   * was cleanly checked out.
+   */
+  checkout(branchOrRevision: string, cleanState: boolean): boolean {
+    if (cleanState) {
+      // Abort any outstanding ams.
+      this.runGraceful(['am', '--abort'], {stdio: 'ignore'});
+      // Abort any outstanding cherry-picks.
+      this.runGraceful(['cherry-pick', '--abort'], {stdio: 'ignore'});
+      // Abort any outstanding rebases.
+      this.runGraceful(['rebase', '--abort'], {stdio: 'ignore'});
+      // Clear any changes in the current repo.
+      this.runGraceful(['reset', '--hard'], {stdio: 'ignore'});
+    }
+    return this.runGraceful(['checkout', branchOrRevision], {stdio: 'ignore'}).status === 0;
+  }
+
+  /**
    * Assert the GitClient instance is using a token with permissions for the all of the
    * provided OAuth scopes.
    */
-  async hasOauthScopes(...requestedScopes: string[]): Promise<true|{error: string}> {
-    const missingScopes: string[] = [];
+  async hasOauthScopes(testFn: OAuthScopeTestFunction): Promise<true|{error: string}> {
     const scopes = await this.getAuthScopesForToken();
-    requestedScopes.forEach(scope => {
-      if (!scopes.includes(scope)) {
-        missingScopes.push(scope);
-      }
-    });
+    const missingScopes: string[] = [];
+    // Test Github OAuth scopes and collect missing ones.
+    testFn(scopes, missingScopes);
     // If no missing scopes are found, return true to indicate all OAuth Scopes are available.
     if (missingScopes.length === 0) {
       return true;
